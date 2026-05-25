@@ -1,0 +1,16 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+terraform/.terraform.lock.hcl
+
+# Web
+web/.env
+
+# Editor
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
