@@ -1,0 +1,20 @@
+# Variables sensibles
+.env
+
+# Git interno
+.git
+
+# Logs
+*.log
+
+# Cache/temp
+tmp/
+cache/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
