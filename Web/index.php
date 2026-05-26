@@ -31,7 +31,7 @@ session_start();
     <p>
       Plataforma corporativa de CyberGuard Solutions para gestión de clientes,
       acceso seguro, registro de usuarios y servicios de ciberseguridad con
-      almacenamiento en base de datos MySQL desplegada en AWS.
+      almacenamiento en base de datos PostgreSQL desplegada en AWS.
     </p>
     <div class="hero-actions">
       <?php if (isset($_SESSION['usuario_nombre'])): ?>
