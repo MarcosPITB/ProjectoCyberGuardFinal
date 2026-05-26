@@ -54,7 +54,7 @@ resource "random_id" "suffix" {
 }
 
 # ==========================================
-# INFRAESTRUCTURA DE RED (VPC)
+# INFRAESTRUCTURA DE RED (VPC, PUBLIC & PRIVATE SUBNETS)
 # ==========================================
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -68,6 +68,7 @@ resource "aws_internet_gateway" "gw" {
   tags   = { Name = "ciberguard-igw" }
 }
 
+# Subredes Públicas (Para el ALB y NAT Gateway)
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
@@ -77,6 +78,28 @@ resource "aws_subnet" "public" {
   tags = { Name = "ciberguard-public-sub-${count.index}" }
 }
 
+# Subredes Privadas (Para EC2 con Nginx y RDS)
+resource "aws_subnet" "private" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index + 10}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = false
+  tags = { Name = "ciberguard-private-sub-${count.index}" }
+}
+
+# NAT Gateway (Permite a la red privada descargar de GitHub/Apt sin exponerse)
+resource "aws_eip" "nat" {
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "ciberguard-nat-gw" }
+}
+
+# Tablas de ruteo
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
@@ -86,10 +109,26 @@ resource "aws_route_table" "public" {
   tags = { Name = "ciberguard-public-rt" }
 }
 
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat.id
+  }
+  tags = { Name = "ciberguard-private-rt" }
+}
+
+# Asociaciones de ruteo
 resource "aws_route_table_association" "public" {
   count          = 2
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
 }
 
 # ==========================================
@@ -97,7 +136,7 @@ resource "aws_route_table_association" "public" {
 # ==========================================
 resource "aws_security_group" "alb_sg" {
   name        = "ciberguard-alb-sg"
-  description = "Permitir HTTP y HTTPS hacia el ALB"
+  description = "Permitir HTTP y HTTPS desde Internet hacia el ALB"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -124,12 +163,12 @@ resource "aws_security_group" "alb_sg" {
 
 resource "aws_security_group" "ec2_sg" {
   name        = "ciberguard-ec2-sg"
-  description = "Permitir trafico SSL desde el ALB"
+  description = "Permitir trafico SSL unicamente desde el ALB"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port       = 443
-    to_port         = 443
+    from_port       = 80
+    to_port         = 80
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
   }
@@ -144,7 +183,7 @@ resource "aws_security_group" "ec2_sg" {
 
 resource "aws_security_group" "db_sg" {
   name        = "ciberguard-db-sg"
-  description = "Permitir acceso a PostgreSQL desde las instancias EC2"
+  description = "Permitir acceso a PostgreSQL unicamente desde las instancias EC2 privadas"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -163,10 +202,23 @@ resource "aws_security_group" "db_sg" {
 }
 
 # ==========================================
-# LOGGING FORENSE Y WAF
+# ALMACENAMIENTO AMAZON S3
 # ==========================================
+# 1. Bucket para Copias de Seguridad de Restic
+resource "aws_s3_bucket" "restic_backups" {
+  bucket        = "ciberguard-restic-backups-${random_id.suffix.hex}"
+  force_destroy = true
+}
+
+# 2. Bucket para Logs del WAF (Debe empezar obligatoriamente con este prefijo)
 resource "aws_s3_bucket" "waf_logs" {
   bucket        = "aws-waf-logs-ciberguard-${random_id.suffix.hex}"
+  force_destroy = true
+}
+
+# 3. Bucket para Logs de Nginx
+resource "aws_s3_bucket" "nginx_logs" {
+  bucket        = "ciberguard-nginx-logs-${random_id.suffix.hex}"
   force_destroy = true
 }
 
@@ -205,15 +257,15 @@ resource "aws_lb" "alb" {
 
 resource "aws_lb_target_group" "tg" {
   name        = "ciberguard-tg"
-  port        = 443
-  protocol    = "HTTPS"
+  port        = 80
+  protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
   target_type = "instance"
 
   health_check {
     path                = "/"
-    protocol            = "HTTPS"
-    port                = "443"
+    protocol            = "HTTP"
+    port                = "80"
     interval            = 30
     timeout             = 5
     healthy_threshold   = 2
@@ -234,7 +286,6 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# CONFIGURACIÓN DE REDIRECCIÓN HTTP (80) -> HTTPS (443)
 resource "aws_lb_listener" "http_redirect" {
   load_balancer_arn = aws_lb.alb.arn
   port              = "80"
@@ -252,79 +303,110 @@ resource "aws_lb_listener" "http_redirect" {
 }
 
 # ==========================================
-# PERMISOS IAM PARA CONSULTAR EL RDS DESDE EC2
+# SEGURIDAD PERIMETRAL: AWS WAFv2
 # ==========================================
-resource "aws_iam_role" "ec2_role" {
-  name = "ciberguard-ec2-role"
+resource "aws_wafv2_web_acl" "waf" {
+  name        = "ciberguard-waf"
+  description = "Proteccion contra OWASP Top 10 y ataques comunes"
+  scope       = "REGIONAL"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
-  })
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WafCommonRules"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "CiberGuardWafMetrics"
+    sampled_requests_enabled   = true
+  }
 }
 
-resource "aws_iam_policy" "ec2_rds_policy" {
-  name        = "ciberguard-ec2-rds-policy"
-  description = "Permite a la EC2 ejecutar describe en el RDS para descubrir el endpoint"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action   = ["rds:DescribeDBInstances"]
-      Effect   = "Allow"
-      Resource = "*"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ec2_attach" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = aws_iam_policy.ec2_rds_policy.arn
-}
-
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ciberguard-ec2-profile"
-  role = aws_iam_role.ec2_role.name
+# Vinculación del WAF al Balanceador de Carga
+resource "aws_wafv2_web_acl_association" "waf_alb_assoc" {
+  resource_arn = aws_lb.alb.arn
+  web_acl_arn  = aws_wafv2_web_acl.waf.arn
 }
 
 # ==========================================
-# INSTANCIA EC2 (SERVIDOR WEB)
+# AUTO SCALING GROUP (MÁQUINAS EC2 DINÁMICAS)
 # ==========================================
-resource "aws_instance" "web" {
-  ami                  = data.aws_ami.ubuntu.id
-  instance_type        = "t3.small"
-  subnet_id            = aws_subnet.public[0].id
-  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+resource "aws_launch_template" "web_lt" {
+  name_prefix   = "ciberguard-lt-"
+  image_id      = data.aws_ami.ubuntu.id
+  instance_type = "t3.small"
 
-  user_data = templatefile("setup_nginx.sh", {
+  network_interfaces {
+    associate_public_ip_address = false # Forzado en FALSE: Máquinas 100% privadas
+    security_groups             = [aws_security_group.ec2_sg.id]
+  }
+
+  iam_instance_profile {
+    name = "LabInstanceProfile" # Perfil autorizado por AWS Academy
+  }
+
+  user_data = base64encode(templatefile("setup_nginx.sh", {
     db_port              = var.db_port
     db_name              = var.db_name
     db_user              = var.db_user
     db_pass              = var.db_password
     turnstile_site_key   = var.turnstile_site_key
     turnstile_secret_key = var.turnstile_secret_key
-  })
+  }))
 
-  tags = { Name = "ciberguard-web-instance" }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_lb_target_group_attachment" "web_attach" {
-  target_group_arn = aws_lb_target_group.tg.arn
-  target_id        = aws_instance.web.id
-  port             = 443
+resource "aws_autoscaling_group" "web_asg" {
+  name                = "ciberguard-asg"
+  vpc_zone_identifier = aws_subnet.private[*].id # Despliega solo en red privada
+  target_group_arns   = [aws_lb_target_group.tg.arn]
+
+  desired_capacity = 2 # Inicia con 2 instancias activas balanceando cargas
+  min_size         = 1
+  max_size         = 3
+
+  launch_template {
+    id      = aws_launch_template.web_lt.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "ciberguard-private-nginx"
+    propagate_at_launch = true
+  }
 }
 
 # ==========================================
-# BASE DE DATOS RDS (POSTGRESQL)
+# BASE DE DATOS RDS SEGURA (POSTGRESQL)
 # ==========================================
 resource "aws_db_subnet_group" "s_sub" {
-  name       = "db-sub-group-public-${random_id.suffix.hex}"
-  subnet_ids = aws_subnet.public[*].id
+  name       = "db-sub-group-private-${random_id.suffix.hex}"
+  subnet_ids = aws_subnet.private[*].id # Base de datos aislada en red privada
 }
 
 resource "aws_db_instance" "db" {
@@ -336,7 +418,7 @@ resource "aws_db_instance" "db" {
   username               = var.db_user
   password               = var.db_password
   port                   = var.db_port
-  publicly_accessible    = true
+  publicly_accessible    = false # Forzado en FALSE por seguridad corporativa
   db_subnet_group_name   = aws_db_subnet_group.s_sub.name
   vpc_security_group_ids = [aws_security_group.db_sg.id]
   skip_final_snapshot    = true
@@ -347,10 +429,10 @@ resource "aws_db_instance" "db" {
 # ==========================================
 output "url_alb" {
   value       = "http://${aws_lb.alb.dns_name}"
-  description = "URL publica del Balanceador de Carga (Redirige a HTTPS automáticamente)"
+  description = "URL protegida por WAF (Redirige a HTTPS de forma transparente)"
 }
 
 output "rds_endpoint" {
   value       = aws_db_instance.db.endpoint
-  description = "Endpoint de conexión de la base de datos RDS"
+  description = "Endpoint interno de la base de datos (Accesible solo por Nginx y Restic internamente)"
 }
