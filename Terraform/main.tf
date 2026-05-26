@@ -35,6 +35,9 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+# Obtener dinámicamente el ID de la cuenta de AWS actual para las políticas de S3
+data "aws_caller_identity" "current" {}
+
 # ==========================================
 # GENERACIÓN DE CERTIFICADO SSL PARA EL ALB
 # ==========================================
@@ -220,10 +223,10 @@ resource "aws_security_group" "rds" {
   vpc_id = aws_vpc.main.id
 
   ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ec2.id]
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -253,6 +256,27 @@ resource "aws_s3_bucket" "nginx_logs" {
   force_destroy = true
 }
 
+# Asignar la política obligatoria al bucket para habilitar los logs nativos del ALB
+resource "aws_s3_bucket_policy" "allow_alb_logging" {
+  bucket = aws_s3_bucket.nginx_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowALBAccessLogs"
+        Effect = "Allow"
+        Principal = {
+          # ID de cuenta fijo de AWS para ELB en la región us-east-1
+          AWS = "arn:aws:iam::127311923021:root"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.nginx_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+      }
+    ]
+  })
+}
+
 # ==========================================
 # 4. BALANCEADOR DE CARGA (ALB) + REDIRECCIÓN
 # ==========================================
@@ -263,6 +287,12 @@ resource "aws_lb" "web_alb" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = aws_subnet.public[*].id
+
+  # Captura nativa de logs activada y dirigida al bucket de Nginx
+  access_logs {
+    bucket  = aws_s3_bucket.nginx_logs.id
+    enabled = true
+  }
 }
 
 # Target Group conectado al puerto SSL (443) de Nginx
@@ -333,12 +363,12 @@ resource "aws_launch_template" "web_lt" {
   }
 
   user_data = base64encode(templatefile("${path.module}/setup_nginx.sh", {
-    github_repo = var.github_repo
-    db_host     = split(":", aws_db_instance.db.endpoint)[0]
-    db_port     = "5432"
-    db_user     = var.db_user
-    db_password = var.db_password
-    db_name     = var.db_name
+    github_repo          = var.github_repo
+    db_host              = split(":", aws_db_instance.db.endpoint)[0]
+    db_port              = "5432"
+    db_user              = var.db_user
+    db_password          = var.db_password
+    db_name              = var.db_name
     turnstile_site_key   = var.turnstile_site_key
     turnstile_secret_key = var.turnstile_secret_key
   }))
@@ -356,7 +386,7 @@ resource "aws_autoscaling_group" "web_asg" {
   vpc_zone_identifier = aws_subnet.private[*].id
 
   launch_template {
-    id      = aws_launch_template.web_lt.id 
+    id      = aws_launch_template.web_lt.id
     version = "$Latest"
   }
 
@@ -374,16 +404,19 @@ resource "aws_autoscaling_group" "web_asg" {
 resource "aws_wafv2_web_acl" "waf" {
   name        = "cyberguard-waf"
   scope       = "REGIONAL"
-  description = "Filtros WAF para capas de aplicacion"
+  description = "Filtros avanzados WAF para la capa de aplicacion - OWASP Top 10"
 
   default_action {
     allow {}
   }
 
+  # ------------------------------------------------------------------
+  # REGLA 1: Lista de reputación de IPs de Amazon (Filtro rápido)
+  # ------------------------------------------------------------------
   rule {
     name     = "AWSManagedRulesAmazonIpReputationList"
     priority = 1
-    
+
     override_action {
       none {}
     }
@@ -402,6 +435,82 @@ resource "aws_wafv2_web_acl" "waf" {
     }
   }
 
+  # ------------------------------------------------------------------
+  # REGLA 2: Reglas Core del OWASP Top 10 (Inspección general)
+  # ------------------------------------------------------------------
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WafCommonRuleSetMetrics"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # ------------------------------------------------------------------
+  # REGLA 3: Protección contra Inyecciones SQL (SQLi)
+  # ------------------------------------------------------------------
+  rule {
+    name     = "AWSManagedRulesSQLiRuleSet"
+    priority = 3
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesSQLiRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WafSqlInjectionMetrics"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # ------------------------------------------------------------------
+  # REGLA 4: Filtro de vectores de ataque y exploits conocidos
+  # ------------------------------------------------------------------
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 4
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WafKnownBadInputsMetrics"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # CONFIGURACIÓN DE VISIBILIDAD GLOBAL DEL WAF
   visibility_config {
     cloudwatch_metrics_enabled = true
     metric_name                = "cyberguardWafMetrics"
@@ -425,7 +534,7 @@ resource "aws_wafv2_web_acl_logging_configuration" "waf_logging" {
 
 resource "aws_db_subnet_group" "rds_subnet_group" {
   name       = "cyberguard-rds-subnet-group"
-  subnet_ids = aws_subnet.database[*].id
+  subnet_ids = aws_subnet.public[*].id
 }
 
 resource "aws_db_instance" "db" {
@@ -440,6 +549,7 @@ resource "aws_db_instance" "db" {
   db_subnet_group_name   = aws_db_subnet_group.rds_subnet_group.name
   vpc_security_group_ids = [aws_security_group.rds.id]
   skip_final_snapshot    = true
+  publicly_accessible    = true
 }
 
 # ==========================================

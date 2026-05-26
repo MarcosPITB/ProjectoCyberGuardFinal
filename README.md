@@ -2,7 +2,7 @@
 
 # Web
 
-Web corporativa de ciberseguridad con inicio de sesión y área privada para clientes.
+Web corporativa con inicio de sesión y área privada para clientes.
 
 ## ✨ Características
 
@@ -50,13 +50,50 @@ Configuración en Terraform y Bash para desplegar de forma automática la infrae
    terraform apply
 
 
+# Scripts de Restic
+
+## scriptBackup.sh
+
+Este script automatiza la extracción segura de datos de la base de datos. Está diseñado para poder ser programado mediante tareas Cron.
+
+### Ejecución manual
+
+```bash
+   ./scriptBackup.sh
+```
+
+## scriptRestore.sh
+
+Este script permite recuperar la base de datos de los backups hechos con el script de scriptBackup.sh
+
+### Ejecución manual
+
+```bash
+   ./scriptRestore.sh
+```
+
+
 # Configuración Requerida
 
-Antes de arrancar el proyecto, debes crear un **terraform.tfvars** en el mismo directorio de Terraform con las siguientes **variables de entorno**:
+Antes de arrancar la infraestructura, debes crear un **terraform.tfvars** en el mismo directorio de Terraform con las siguientes **variables de entorno**:
 
-* `db_password` - Servidor de la base de datos.
-* `db_name` - Puerto (ej: 5432).
-* `db_user` - Nombre de la base de datos.
-* `db_port` - Usuario de la base de datos.
+* `aws_region` - Región de la infraestructura.
+* `db_name` - Nombre de la base de datos.
+* `db_user` - Nombre del usuario de la base de datos.
+* `db_password` - Contraseña de la base de datos.
+* `github_repo` - Repositorio de Github.
 * `turnstile_site_key` - Clave pública de Cloudflare Turnstile.
 * `turnstile_secret_key` - Clave privada de Cloudflare Turnstile.
+
+Para que funcionen los scripts de Restic, debes crear un **.env** en el mismo directorio de ReesticScripts con las siguientes **variables de entorno**:
+
+* `AWS_ACCESS_KEY_ID` - ID de tu clave de acceso de AWS.
+* `AWS_SECRET_ACCESS_KEY` - Clave de acceso secreta de AWS.
+* `AWS_SESSION_TOKEN` - Token de sesión temporal de AWS.
+* `RESTIC_PASSWORD` - Contraseña del repositorio de Restic.
+* `RESTIC_REPOSITORY` - Ubicación del repositorio de Restic.
+* `DB_HOST` - URL de la instancia de RDS.
+* `DB_PORT` - Puerto de la base de datos.
+* `DB_NAME` - Nombre de la base de datos.
+* `DB_USER` - Nombre del usuario de la base de datos.
+* `PGPASSWORD` - Contraseña de la base de datos.
